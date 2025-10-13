@@ -402,17 +402,17 @@ def capture_training_output(system, tmp_path, num_predictions, progress_bar, sta
                     progress_bar.progress(10)
                     time.sleep(0.5)
                     
-                    # Train model
-                    status_text.text("🚀 Training AI model with optimal settings...")
+                    # Train model (using latest 1 month for speed)
+                    status_text.text("🚀 Training XGBoost model (using latest 1 month of data)...")
                     progress_bar.progress(30)
                     
-                    features_df = system.train(tmp_path, sequence_length=50, prediction_length=num_predictions)
+                    features_df = system.train(tmp_path, sequence_length=50, prediction_length=num_predictions, months=1)
                     
                     # Generate predictions
                     status_text.text("🔮 Generating lottery numbers...")
                     progress_bar.progress(80)
                     
-                    predictions = system.predict(features_df, sequence_length=50)
+                    predictions = system.predict(features_df, sequence_length=50, prediction_length=num_predictions)
                     
                     progress_bar.progress(100)
                     status_text.text("✅ Predictions generated successfully!")
@@ -424,17 +424,17 @@ def capture_training_output(system, tmp_path, num_predictions, progress_bar, sta
             progress_bar.progress(10)
             time.sleep(0.5)
             
-            # Train model
-            status_text.text("🚀 Training AI model with optimal settings...")
+            # Train model (using latest 1 month for speed)
+            status_text.text("🚀 Training XGBoost model (using latest 1 month of data)...")
             progress_bar.progress(30)
             
-            features_df = system.train(tmp_path, sequence_length=50, prediction_length=num_predictions)
+            features_df = system.train(tmp_path, sequence_length=50, prediction_length=num_predictions, months=1)
             
             # Generate predictions
             status_text.text("🔮 Generating lottery numbers...")
             progress_bar.progress(80)
             
-            predictions = system.predict(features_df, sequence_length=50)
+            predictions = system.predict(features_df, sequence_length=50, prediction_length=num_predictions)
             
             progress_bar.progress(100)
             status_text.text("✅ Predictions generated successfully!")
@@ -450,12 +450,11 @@ def main():
     # Simple header
     st.title("🎲 Lottery Number Predictor")
     st.markdown("AI-Powered Lottery Number Generation")
-    
     # File upload
     uploaded_file = st.file_uploader(
         "Upload your lottery data CSV file",
         type=['csv'],
-        help="Upload a CSV file with columns: 'Draw Date' and 'Winning Numbers'"
+        help="Upload a CSV file with 'Draw Date' and 'Winning Numbers' columns. All other columns will be ignored."
     )
     
     # Settings
@@ -537,7 +536,7 @@ def main():
     st.write("3. Click 'Generate Predictions' to train the AI model")
     st.write("4. View your lottery number predictions")
     
-    st.write("**Data Format:** Your CSV should have columns: `Draw Date` and `Winning Numbers`")
+    st.write("**Data Format:** Your CSV must have `Draw Date` and `Winning Numbers` columns. All other columns will be automatically removed and ignored during prediction.")
     
     # Remove AI model name from display
     st.write("**Model:** Advanced AI System (Proprietary)")

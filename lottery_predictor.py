@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
 """
-Lottery Number Predictor - Complete All-in-One System
-Temporal LSTM model for lottery number prediction using historical patterns.
+Lottery Number Predictor - XGBoost Implementation
+Fast and efficient lottery number prediction using XGBoost.
 """
 
 import os
-import sys
 import warnings
 import argparse
-from datetime import datetime, timedelta
-from typing import List, Dict, Any, Tuple
+from datetime import datetime
+from typing import List, Dict, Tuple
 import pandas as pd
 import numpy as np
-import torch
-import torch.nn as nn
-import pytorch_lightning as pl
-from torch.utils.data import Dataset, DataLoader
+import xgboost as xgb
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -27,18 +24,30 @@ warnings.filterwarnings('ignore')
 class LotteryDataPreprocessor:
     """Data preprocessor for lottery data."""
     
-    def __init__(self, sequence_length: int = 50, prediction_length: int = 5):
+    def __init__(self, sequence_length: int = 50):
         self.sequence_length = sequence_length
-        self.prediction_length = prediction_length
         self.max_number = 80
         
-    def load_data(self, file_path: str) -> pd.DataFrame:
-        """Load lottery data from CSV file."""
+    def load_data(self, file_path: str, months: int = 1) -> pd.DataFrame:
+        """Load lottery data from CSV file and filter to latest N months."""
+        print(f"Loading data (latest {months} month(s) only for speed)...")
         df = pd.read_csv(file_path)
+        
+        # Keep only the columns we need: Draw Date and Winning Numbers
+        # Drop all other columns as they're not useful for prediction
+        required_columns = ['Draw Date', 'Winning Numbers']
+        df = df[required_columns]
+        
         df['Draw Date'] = pd.to_datetime(df['Draw Date'])
+        
+        # Filter to latest N months only (for faster training)
+        latest_date = df['Draw Date'].max()
+        cutoff_date = latest_date - pd.DateOffset(months=months)
+        df = df[df['Draw Date'] >= cutoff_date]
         
         print(f"Loaded dataset: {len(df)} draws")
         print(f"   Date range: {df['Draw Date'].min().date()} to {df['Draw Date'].max().date()}")
+        print(f"   Using latest {months} month(s) of data for optimal speed!")
         
         # Parse winning numbers
         df['numbers'] = df['Winning Numbers'].apply(lambda x: [int(num) for num in x.split()])
@@ -51,6 +60,9 @@ class LotteryDataPreprocessor:
         features_data = []
         
         for idx, row in df.iterrows():
+            if idx % 10000 == 0:
+                print(f"Processing draw {idx}/{len(df)}...")
+            
             date = row['Draw Date']
             numbers = row['numbers']
             
@@ -65,7 +77,7 @@ class LotteryDataPreprocessor:
                 'week_of_year': date.isocalendar()[1],
             }
             
-            # Historical frequency features
+            # Historical frequency features (last 100 draws)
             if idx > 0:
                 historical_numbers = []
                 for i in range(max(0, idx - 100), idx):
@@ -73,13 +85,29 @@ class LotteryDataPreprocessor:
                         historical_numbers.extend(df.iloc[i]['numbers'])
                 
                 for num in range(1, self.max_number + 1):
-                    feature_row[f'freq_{num}'] = (
+                    feature_row[f'freq_100_{num}'] = (
                         historical_numbers.count(num) / len(historical_numbers) 
                         if historical_numbers else 0.0
                     )
             else:
                 for num in range(1, self.max_number + 1):
-                    feature_row[f'freq_{num}'] = 1.0 / self.max_number
+                    feature_row[f'freq_100_{num}'] = 1.0 / self.max_number
+            
+            # Recent frequency features (last 10 draws)
+            if idx > 0:
+                recent_numbers = []
+                for i in range(max(0, idx - 10), idx):
+                    if i < len(df):
+                        recent_numbers.extend(df.iloc[i]['numbers'])
+                
+                for num in range(1, self.max_number + 1):
+                    feature_row[f'freq_10_{num}'] = (
+                        recent_numbers.count(num) / len(recent_numbers) 
+                        if recent_numbers else 0.0
+                    )
+            else:
+                for num in range(1, self.max_number + 1):
+                    feature_row[f'freq_10_{num}'] = 1.0 / self.max_number
             
             # Target encoding (binary indicators for each number)
             for num in range(1, self.max_number + 1):
@@ -104,276 +132,125 @@ class LotteryDataPreprocessor:
                 'min_gap': float(min(gaps)) if gaps else 0.0,
             })
             
-            # Hot/Cold numbers (recent pattern analysis)
-            recent_numbers = []
-            for i in range(max(0, idx - 10), idx):
-                if i < len(df):
-                    recent_numbers.extend(df.iloc[i]['numbers'])
-            
-            hot_numbers = [num for num in range(1, self.max_number + 1) if recent_numbers.count(num) >= 3]
-            cold_numbers = [num for num in range(1, self.max_number + 1) if recent_numbers.count(num) == 0]
-            
-            feature_row.update({
-                'hot_numbers_count': float(len(hot_numbers)),
-                'cold_numbers_count': float(len(cold_numbers)),
-                'hot_numbers_drawn': float(sum(1 for num in numbers if num in hot_numbers)),
-                'cold_numbers_drawn': float(sum(1 for num in numbers if num in cold_numbers)),
-            })
-            
             features_data.append(feature_row)
         
+        print("Feature extraction completed!")
         return pd.DataFrame(features_data)
 
 
-class LotteryDataset(Dataset):
-    """PyTorch dataset for lottery sequences."""
-    
-    def __init__(self, features_df: pd.DataFrame, sequence_length: int, prediction_length: int):
-        self.sequence_length = sequence_length
-        self.prediction_length = prediction_length
-        
-        # Separate features and targets
-        target_cols = [f'target_{i}' for i in range(1, 81)]
-        feature_cols = [col for col in features_df.columns 
-                       if col not in target_cols + ['time_idx']]
-        
-        self.features = features_df[feature_cols].values.astype(np.float32)
-        self.targets = features_df[target_cols].values.astype(np.float32)
-        
-        # Normalize features
-        self.scaler = StandardScaler()
-        self.features = self.scaler.fit_transform(self.features)
-        
-        print(f"Dataset: {len(self.features)} samples, {self.features.shape[1]} features")
-        
-    def __len__(self):
-        return len(self.features) - self.sequence_length - self.prediction_length + 1
-    
-    def __getitem__(self, idx):
-        feature_seq = self.features[idx:idx + self.sequence_length]
-        target_seq = self.targets[idx + self.sequence_length:idx + self.sequence_length + self.prediction_length]
-        return torch.FloatTensor(feature_seq), torch.FloatTensor(target_seq)
-
-
-class LotteryPredictor(pl.LightningModule):
-    """Advanced LSTM-based lottery number predictor."""
-    
-    def __init__(self, input_size: int, hidden_size: int = 128, num_layers: int = 2, 
-                 dropout: float = 0.2, learning_rate: float = 0.001, prediction_length: int = 5):
-        super().__init__()
-        self.save_hyperparameters()
-        
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.prediction_length = prediction_length
-        self.learning_rate = learning_rate
-        
-        # Bidirectional LSTM encoder
-        self.lstm = nn.LSTM(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            dropout=dropout,
-            batch_first=True,
-            bidirectional=True
-        )
-        
-        # Multi-head attention for sequence modeling
-        self.attention = nn.MultiheadAttention(
-            embed_dim=hidden_size * 2,
-            num_heads=8,
-            dropout=dropout,
-            batch_first=True
-        )
-        
-        # Output layers for each future draw
-        self.output_layers = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(hidden_size * 2, hidden_size),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_size, 80),  # 80 possible numbers
-                nn.Sigmoid()
-            ) for _ in range(prediction_length)
-        ])
-        
-        self.criterion = nn.BCELoss()
-        
-    def forward(self, x):
-        # LSTM encoding
-        lstm_out, _ = self.lstm(x)
-        
-        # Apply attention
-        attn_out, _ = self.attention(lstm_out, lstm_out, lstm_out)
-        
-        # Use final hidden state for predictions
-        last_hidden = attn_out[:, -1, :]
-        
-        # Generate predictions for each future draw
-        predictions = []
-        for i in range(self.prediction_length):
-            pred = self.output_layers[i](last_hidden)
-            predictions.append(pred)
-        
-        return torch.stack(predictions, dim=1)
-    
-    def training_step(self, batch, batch_idx):
-        features, targets = batch
-        predictions = self(features)
-        loss = self.criterion(predictions, targets)
-        
-        # Calculate accuracy
-        with torch.no_grad():
-            pred_binary = predictions > 0.5
-            target_binary = targets > 0.5
-            accuracy = (pred_binary == target_binary).float().mean()
-        
-        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log('train_accuracy', accuracy, on_step=True, on_epoch=True)
-        
-        return loss
-    
-    def validation_step(self, batch, batch_idx):
-        features, targets = batch
-        predictions = self(features)
-        loss = self.criterion(predictions, targets)
-        
-        pred_binary = predictions > 0.5
-        target_binary = targets > 0.5
-        accuracy = (pred_binary == target_binary).float().mean()
-        
-        self.log('val_loss', loss, on_epoch=True, prog_bar=True)
-        self.log('val_accuracy', accuracy, on_epoch=True, prog_bar=True)
-        
-        return loss
-    
-    def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=5
-        )
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": scheduler,
-            "monitor": "val_loss"
-        }
-
-
 class LotterySystem:
-    """Complete lottery prediction system."""
+    """Complete lottery prediction system using XGBoost."""
     
-    def __init__(self, model_params: Dict = None, trainer_params: Dict = None):
-        # Optimal parameters for best results (no user configuration needed)
-        self.model_params = model_params or {
-            'hidden_size': 128,
-            'num_layers': 2,
-            'dropout': 0.2,
-            'learning_rate': 0.001,
-        }
-        
-        # Optimal training parameters for non-technical users
-        self.trainer_params = trainer_params or {
-            'max_epochs': 30,  # Optimal balance of speed and accuracy
-            'accelerator': 'gpu' if torch.cuda.is_available() else 'cpu',
-            'devices': 1,
-            'gradient_clip_val': 1.0,
-        }
-        
-        self.model = None
-        self.trainer = None
+    def __init__(self):
+        self.models = {}  # Dictionary to store models for each number
         self.preprocessor = None
+        self.feature_cols = None
         
-        
-    def prepare_data(self, file_path: str, sequence_length: int, prediction_length: int):
+    def prepare_data(self, file_path: str, sequence_length: int = 50, months: int = 1):
         """Load and prepare data for training."""
         print("Loading and processing data...")
         
-        self.preprocessor = LotteryDataPreprocessor(sequence_length, prediction_length)
-        df = self.preprocessor.load_data(file_path)
+        self.preprocessor = LotteryDataPreprocessor(sequence_length)
+        df = self.preprocessor.load_data(file_path, months=months)
         features_df = self.preprocessor.create_features(df)
         
         print("Data preprocessing completed")
         
-        # Create dataset
-        dataset = LotteryDataset(features_df, sequence_length, prediction_length)
-        
-        # Train/validation split
-        total_size = len(dataset)
-        train_size = int(0.8 * total_size)
-        val_size = total_size - train_size
-        
-        train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
-        
-        train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=0)
-        val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=0)
-        
-        return train_loader, val_loader, dataset, features_df
+        return features_df
     
-    def train(self, file_path: str, sequence_length: int = 50, prediction_length: int = 5):
-        """Train the lottery prediction model."""
+    def train(self, file_path: str, sequence_length: int = 50, prediction_length: int = 5, months: int = 1):
+        """Train the lottery prediction model using XGBoost."""
         # Prepare data
-        train_loader, val_loader, dataset, features_df = self.prepare_data(
-            file_path, sequence_length, prediction_length
+        features_df = self.prepare_data(file_path, sequence_length, months=months)
+        
+        # Separate features and targets
+        target_cols = [f'target_{i}' for i in range(1, 81)]
+        self.feature_cols = [col for col in features_df.columns 
+                            if col not in target_cols + ['time_idx']]
+        
+        X = features_df[self.feature_cols].values
+        y = features_df[target_cols].values
+        
+        print(f"Training data shape: X={X.shape}, y={y.shape}")
+        
+        # Split data
+        X_train, X_val, y_train, y_val = train_test_split(
+            X, y, test_size=0.2, random_state=42, shuffle=False
         )
         
-        # Get input size
-        sample_features, _ = dataset[0]
-        input_size = sample_features.shape[1]
+        print("Training XGBoost models...")
+        print("This will be much faster than deep learning!")
         
-        print(f"Initializing model (input size: {input_size})")
-        
-        # Initialize model
-        self.model = LotteryPredictor(
-            input_size=input_size,
-            prediction_length=prediction_length,
-            **self.model_params
-        )
-        
-        # Setup trainer
-        callbacks = [
-            pl.callbacks.EarlyStopping(monitor="val_loss", patience=10, mode="min"),
-        ]
-        
-        self.trainer = pl.Trainer(
-            callbacks=callbacks, 
-            enable_checkpointing=False,
-            logger=False,
-            **self.trainer_params
-        )
-        
-        # Train
-        print("Starting training...")
-        self.trainer.fit(self.model, train_loader, val_loader)
+        # Train separate model for each number (1-80)
+        for num_idx in range(80):
+            if (num_idx + 1) % 10 == 0:
+                print(f"Training model for number {num_idx + 1}/80...")
+            
+            # XGBoost parameters optimized for speed and accuracy
+            params = {
+                'objective': 'binary:logistic',
+                'eval_metric': 'logloss',
+                'max_depth': 6,
+                'learning_rate': 0.1,
+                'subsample': 0.8,
+                'colsample_bytree': 0.8,
+                'tree_method': 'hist',  # Faster training
+                'verbosity': 0,
+            }
+            
+            # Create DMatrix for XGBoost
+            dtrain = xgb.DMatrix(X_train, label=y_train[:, num_idx])
+            dval = xgb.DMatrix(X_val, label=y_val[:, num_idx])
+            
+            # Train model
+            evals = [(dval, 'eval')]
+            model = xgb.train(
+                params,
+                dtrain,
+                num_boost_round=100,
+                evals=evals,
+                early_stopping_rounds=10,
+                verbose_eval=False
+            )
+            
+            self.models[num_idx] = model
         
         print("Training completed!")
         return features_df
     
-    def predict(self, features_df: pd.DataFrame, sequence_length: int, top_k: int = 20) -> List[List[int]]:
+    def predict(self, features_df: pd.DataFrame, sequence_length: int = 50, top_k: int = 20, 
+                prediction_length: int = 5) -> List[List[int]]:
         """Generate lottery number predictions."""
-        if self.model is None:
-            raise ValueError("No trained model available!")
+        if not self.models:
+            raise ValueError("No trained models available!")
         
-        self.model.eval()
+        # Get the latest features
+        latest_features = features_df[self.feature_cols].iloc[-1:].values
         
-        # Prepare latest sequence
-        feature_cols = [col for col in features_df.columns 
-                       if col not in [f'target_{i}' for i in range(1, 81)] + ['time_idx']]
+        # Create DMatrix for prediction
+        dtest = xgb.DMatrix(latest_features)
         
-        # Create dataset to get the scaler
-        temp_dataset = LotteryDataset(features_df, sequence_length, 1)
-        latest_features = temp_dataset.scaler.transform(features_df[feature_cols].values.astype(np.float32))
-        latest_sequence = torch.FloatTensor(latest_features[-sequence_length:])
+        # Predict probabilities for each number
+        predictions = []
+        for num_idx in range(80):
+            model = self.models[num_idx]
+            prob = model.predict(dtest)[0]
+            predictions.append(prob)
         
-        with torch.no_grad():
-            predictions = self.model(latest_sequence.unsqueeze(0))
-            predictions = predictions.squeeze(0)
+        # Convert to numpy array
+        predictions = np.array(predictions)
+        
+        # Generate multiple draws
+        predicted_draws = []
+        for _ in range(prediction_length):
+            # Get top-k numbers
+            top_indices = np.argsort(predictions)[-top_k:][::-1]
+            predicted_numbers = sorted([idx + 1 for idx in top_indices])
+            predicted_draws.append(predicted_numbers)
             
-            predicted_draws = []
-            for step in range(self.model.prediction_length):
-                step_probs = predictions[step]
-                top_indices = torch.topk(step_probs, top_k).indices
-                predicted_numbers = sorted([idx.item() + 1 for idx in top_indices])
-                predicted_draws.append(predicted_numbers)
+            # Add some randomness for variety in predictions
+            predictions = predictions + np.random.normal(0, 0.05, size=80)
+            predictions = np.clip(predictions, 0, 1)
         
         return predicted_draws
     
@@ -392,8 +269,8 @@ class LotterySystem:
         
         # Number frequency
         freq_series = pd.Series(all_numbers).value_counts().sort_index()
-        ax1.bar(freq_series.index, freq_series.values, alpha=0.7)
-        ax1.set_title('Historical Number Frequency')
+        ax1.bar(freq_series.index, freq_series.values, alpha=0.7, color='steelblue')
+        ax1.set_title('Historical Number Frequency', fontsize=14, fontweight='bold')
         ax1.set_xlabel('Number')
         ax1.set_ylabel('Frequency')
         ax1.grid(True, alpha=0.3)
@@ -403,7 +280,8 @@ class LotterySystem:
         ax2.barh(range(len(most_frequent)), most_frequent.values, color='green', alpha=0.7)
         ax2.set_yticks(range(len(most_frequent)))
         ax2.set_yticklabels(most_frequent.index)
-        ax2.set_title('Top 10 Most Frequent Numbers')
+        ax2.set_title('Top 10 Most Frequent Numbers', fontsize=14, fontweight='bold')
+        ax2.set_xlabel('Frequency')
         
         # Recent trends
         recent_draws = raw_df.tail(50)
@@ -413,7 +291,7 @@ class LotterySystem:
         
         recent_freq = pd.Series(recent_numbers).value_counts().sort_index()
         ax3.bar(recent_freq.index, recent_freq.values, alpha=0.7, color='orange')
-        ax3.set_title('Recent Number Frequency (Last 50 Draws)')
+        ax3.set_title('Recent Number Frequency (Last 50 Draws)', fontsize=14, fontweight='bold')
         ax3.set_xlabel('Number')
         ax3.set_ylabel('Frequency')
         ax3.grid(True, alpha=0.3)
@@ -426,29 +304,56 @@ class LotterySystem:
                 pred_grid[row, col] += 1
         
         sns.heatmap(pred_grid, annot=True, fmt='.0f', cmap='Reds', ax=ax4, cbar=False)
-        ax4.set_title('Predicted Numbers Heatmap (First 3 Draws)')
+        ax4.set_title('Predicted Numbers Heatmap (First 3 Draws)', fontsize=14, fontweight='bold')
+        ax4.set_xlabel('Column (0-9)')
+        ax4.set_ylabel('Row (Tens)')
         
         plt.tight_layout()
         return fig
     
-    
-    
+    def get_feature_importance(self, top_n: int = 20) -> pd.DataFrame:
+        """Get feature importance from the models."""
+        # Average importance across all models
+        importance_dict = {}
+        
+        for num_idx, model in self.models.items():
+            # Get feature importance scores
+            importance_scores = model.get_score(importance_type='gain')
+            
+            # Map feature names to importance
+            for feat_idx, feat_name in enumerate(self.feature_cols):
+                feat_key = f'f{feat_idx}'
+                if feat_key in importance_scores:
+                    if feat_name not in importance_dict:
+                        importance_dict[feat_name] = []
+                    importance_dict[feat_name].append(importance_scores[feat_key])
+        
+        # Calculate average importance
+        avg_importance = {k: np.mean(v) for k, v in importance_dict.items()}
+        
+        # Create DataFrame and sort
+        importance_df = pd.DataFrame(
+            list(avg_importance.items()), 
+            columns=['Feature', 'Importance']
+        ).sort_values('Importance', ascending=False).head(top_n)
+        
+        return importance_df
 
 
 def main():
     """Main execution function."""
-    parser = argparse.ArgumentParser(description='Lottery Number Predictor')
-    parser.add_argument('--data-path', type=str, default='data/train.csv', help='Path to lottery data')
-    parser.add_argument('--epochs', type=int, default=50, help='Training epochs')
+    parser = argparse.ArgumentParser(description='Lottery Number Predictor (XGBoost)')
+    parser.add_argument('--data-path', type=str, default='data/Lottery_Quick_Draw_Winning_Numbers__Beginning_2013_20251013.csv', 
+                       help='Path to lottery data')
     parser.add_argument('--sequence-length', type=int, default=50, help='Input sequence length')
     parser.add_argument('--prediction-length', type=int, default=5, help='Number of future draws')
-    parser.add_argument('--hidden-size', type=int, default=128, help='Model hidden size')
-    parser.add_argument('--learning-rate', type=float, default=0.001, help='Learning rate')
+    parser.add_argument('--months', type=int, default=1, help='Number of months of historical data to use (default: 1 for speed)')
     
     args = parser.parse_args()
     
-    print("Lottery Number Predictor")
-    print("=" * 25)
+    print("=" * 60)
+    print("🎲 Lottery Number Predictor - XGBoost Edition")
+    print("=" * 60)
     
     # Check data file
     if not os.path.exists(args.data_path):
@@ -456,59 +361,59 @@ def main():
         return
     
     # Initialize system
-    model_params = {
-        'hidden_size': args.hidden_size,
-        'learning_rate': args.learning_rate,
-        'num_layers': 2,
-        'dropout': 0.2,
-    }
-    
-    trainer_params = {
-        'max_epochs': args.epochs,
-        'accelerator': 'gpu' if torch.cuda.is_available() else 'cpu',
-        'devices': 1,
-        'gradient_clip_val': 1.0,
-    }
-    
-    system = LotterySystem(model_params, trainer_params)
+    system = LotterySystem()
     
     try:
-        print(f"Training model ({args.epochs} epochs)")
+        print(f"\n📊 Training XGBoost model (FAST!)...")
         features_df = system.train(
             args.data_path, 
             args.sequence_length, 
-            args.prediction_length
+            args.prediction_length,
+            months=args.months
         )
         
         # Make predictions
-        print(f"Generating {args.prediction_length} lottery predictions...")
-        predictions = system.predict(features_df, args.sequence_length)
+        print(f"\n🔮 Generating {args.prediction_length} lottery predictions...")
+        predictions = system.predict(
+            features_df, 
+            args.sequence_length,
+            prediction_length=args.prediction_length
+        )
         
         # Display results
-        print("\nPredicted Numbers:")
-        print("-" * 30)
+        print("\n" + "=" * 60)
+        print("🎯 PREDICTED NUMBERS:")
+        print("=" * 60)
         for i, numbers in enumerate(predictions, 1):
             print(f"Draw {i}: {' '.join(f'{num:2d}' for num in numbers)}")
         
-        
         # Create analysis
         raw_df = pd.read_csv(args.data_path)
+        raw_df = raw_df[['Draw Date', 'Winning Numbers']]
         raw_df['Draw Date'] = pd.to_datetime(raw_df['Draw Date'])
         
         analysis_fig = system.analyze_and_visualize(raw_df, predictions)
-        analysis_fig.show()
         
         # Statistics
         all_predicted = [num for draw in predictions for num in draw]
-        print(f"\nStatistics:")
+        print(f"\n📈 STATISTICS:")
         print(f"   Range: {min(all_predicted)}-{max(all_predicted)}")
         print(f"   Most frequent: {max(set(all_predicted), key=all_predicted.count)}")
         print(f"   Average: {np.mean([np.mean(draw) for draw in predictions]):.1f}")
         
-        print(f"\nComplete! Good luck with your lottery numbers!")
+        # Feature importance
+        print(f"\n🔍 TOP 10 MOST IMPORTANT FEATURES:")
+        importance_df = system.get_feature_importance(top_n=10)
+        for idx, row in importance_df.iterrows():
+            print(f"   {row['Feature']}: {row['Importance']:.2f}")
+        
+        print(f"\n✅ Complete! Good luck with your lottery numbers!")
+        print("=" * 60)
+        
+        plt.show()
         
     except Exception as e:
-        print(f"ERROR: {e}")
+        print(f"❌ ERROR: {e}")
         import traceback
         traceback.print_exc()
 
