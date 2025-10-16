@@ -346,7 +346,7 @@ def main():
     parser.add_argument('--data-path', type=str, default='data/Lottery_Quick_Draw_Winning_Numbers__Beginning_2013_20251013.csv', 
                        help='Path to lottery data')
     parser.add_argument('--sequence-length', type=int, default=50, help='Input sequence length')
-    parser.add_argument('--prediction-length', type=int, default=5, help='Number of future draws')
+    parser.add_argument('--prediction-length', type=int, default=40, help='Number of future draws')
     parser.add_argument('--months', type=int, default=1, help='Number of months of historical data to use (default: 1 for speed)')
     
     args = parser.parse_args()
